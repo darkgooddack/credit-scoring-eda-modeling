@@ -115,7 +115,70 @@ plt.show()
 - упрощения модели за счёт удаления избыточных переменных
 - первичной оценки того, какие признаки могут быть связаны с целевой переменной
 
+```python
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
+
+train_df = pd.read_excel('Training.xlsx')
+
+
+features = train_df.select_dtypes(include=[np.number]).drop(columns=['ID', 'MARKER'])
+corr_matrix = train_df[features.columns.tolist() + ['MARKER']].corr()
+
+plt.figure(figsize=(12, 10))
+
+sns.heatmap(
+    corr_matrix,
+    annot=True,
+    fmt=".2f",
+    cmap='coolwarm',
+    square=True
+)
+
+plt.show()
+```
+
+
 <img width="874" height="757" alt="image" src="https://github.com/user-attachments/assets/10f104b3-6591-4d54-a160-ceb016d6160b" />
+
+Группы A и B имеют сильную положительную связь. Они частично описывают одно и то же.
+
+Набор D, E, F очень похожи, поэтому это классическая мультиколлинеарность.
+
+Большинство остальных связей слабые.
+
+Связь с целевой переменной: все значения около 0, нет сильной линейной зависимости между признаками и целевой переменной. Линейные модели здесь будут плохо работать. 
+
+### 1.4 Анализ категориальных признаков
+
+**Дефолт по полу**
+<img width="991" height="523" alt="image" src="https://github.com/user-attachments/assets/957639a0-42f7-4c64-8084-706fe0a43981" />
+
+**Дефолт по региону**
+<img width="991" height="501" alt="image" src="https://github.com/user-attachments/assets/a05c51f5-4046-41c5-bce6-a0cbea6e72f6" />
+
+**Дефолт по должности**
+<img width="993" height="472" alt="image" src="https://github.com/user-attachments/assets/9d9e5039-3694-4b1d-a7a2-0fb4e794a672" />
+
+Разбиение категорий в признаке “должность” содержит неоднородные и частично дублирующие группы. В частности, позиции Head/Deputy head (organiz.) и Head/Deputy head (division) логически относятся к одной смысловой категории управленческого уровня, однако разделены на отдельные классы. В целом структура признака выглядит избыточно детализированной и не обеспечивает чистого семантического разделения должностей.
+
+**Дефолт по образованию**
+<img width="988" height="433" alt="image" src="https://github.com/user-attachments/assets/b0d95271-9bed-41e3-b072-2b1ea6cf3a80" />
+
+**Дефолт по семейному положению**
+<img width="992" height="494" alt="image" src="https://github.com/user-attachments/assets/d7cc8b3d-bc7d-4368-aa83-ad31734888d3" />
+
+**Дефолт по наличию жилья**
+<img width="986" height="449" alt="image" src="https://github.com/user-attachments/assets/bd480d53-a085-490b-a8d4-eb568df3b1e9" />
+
+**Дефолт по занятости**
+<img width="994" height="484" alt="image" src="https://github.com/user-attachments/assets/d37ee508-a9d0-4e0c-8386-0516cf3679c6" />
+
+Присутствует категория “не в паре”, которая относится не к трудовому положению, а к семейному статусу. Это нарушает семантическую однородность признака и может искажать интерпретацию зависимости дефолта от занятости.
+
+
 
 
 
