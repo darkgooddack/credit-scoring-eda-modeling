@@ -181,6 +181,148 @@ plt.show()
 
 
 
+## 2. Выполнение моделирования
+Обоснование методологии:
+Препроцессинг: Числовые признаки масштабируются (StandardScaler) и заполняются медианой во избежание влияния выбросов. Категориальные признаки кодируются через OneHotEncoder с заполнением пропусков модой.
+Валидация: Используется StratifiedKFold (5 фолдов), чтобы сохранить пропорцию классов в обучающей и валидационной выборках.
+Метрика оптимизации: Основной метрикой выбран ROC-AUC, так как он оценивает способность модели разделять классы независимо от выбранного порога вероятности, что является стандартом в банковском скоринге.
+Предобработка данных (Pipeline)
+```python
+# Разделение признаков и таргета
+X_train = train_df.drop(columns=['ID', 'MARKER'])
+y_train = train_df['MARKER']
+X_test = test_df.drop(columns=['ID', 'MARKER'])
+y_test = test_df['MARKER']
+
+# Списки колонок
+num_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
+cat_features = X_train.select_dtypes(include=['object']).columns.tolist()
+
+# Определение трансформеров
+num_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+cat_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore', drop='first'))
+])
+
+preprocessor = ColumnTransformer(transformers=[
+    ('num', num_transformer, num_features),
+    ('cat', cat_transformer, cat_features)
+])
+```
+
+Алгоритм 1: Линейная модель (Логистическая регрессия)
+Метод: Логистическая регрессия с L2-регуляризацией (Ridge) для минимизации риска переобучения на мультиколлинеарных признаках. Дополнительно применяется балансировка весов классов (class_weight='balanced').
+```python
+from sklearn.linear_model import LogisticRegression
+
+# Создание пайплайна
+lr_pipeline = Pipeline(steps=[
+    ('preprocessor', preprocessor),
+    ('classifier', LogisticRegression(class_weight='balanced', random_state=42, max_iter=1000))
+])
+
+# Сетка гиперпараметров
+lr_param_grid = {
+    'classifier__C': [0.01, 0.1, 1, 10]
+}
+
+# Поиск по сетке
+lr_cv = GridSearchCV(lr_pipeline, lr_param_grid, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1)
+lr_cv.fit(X_train, y_train)
+
+print(f"Лучшие параметры Логистической регрессии: {lr_cv.best_params_}")
+print(f"Лучший Train ROC-AUC: {lr_cv.best_score_:.4f}")
+```
+Алгоритм 2: Случайный лес (Random Forest)
+Метод: Ансамблевый алгоритм бэггинга над решающими деревьями. Устойчив к выбросам, не требует строго линейных зависимостей, эффективно работает с категориальными признаками после One-Hot кодирования.
+```python
+from sklearn.ensemble import RandomForestClassifier
+
+# Создание пайплайна
+rf_pipeline = Pipeline(steps=[
+    ('preprocessor', preprocessor),
+    ('classifier', RandomForestClassifier(class_weight='balanced', random_state=42))
+])
+
+# Сетка гиперпараметров
+rf_param_grid = {
+    'classifier__n_estimators': [100, 200],
+    'classifier__max_depth': [5, 10, 15],
+    'classifier__min_samples_split': [2, 5]
+}
+
+# Поиск по сетке
+rf_cv = GridSearchCV(rf_pipeline, rf_param_grid, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1)
+rf_cv.fit(X_train, y_train)
+
+print(f"Лучшие параметры Random Forest: {rf_cv.best_params_}")
+print(f"Лучший Train ROC-AUC: {rf_cv.best_score_:.4f}")
+```
+
+Алгоритм 3: Градиентный бустинг (LightGBM)
+Метод: Реализация градиентного бустинга от Microsoft, оптимизированная по скорости и объему потребляемой памяти. Последовательно строит деревья, минимизируя ошибку предыдущих, отлично улавливает сложные нелинейные паттерны.
+```python
+from lightgbm import LGBMClassifier
+
+# Создание пайплайна
+lgb_pipeline = Pipeline(steps=[
+    ('preprocessor', preprocessor),
+    ('classifier', LGBMClassifier(scale_pos_weight=len(y_train[y_train==0])/len(y_train[y_train==1]), 
+                                  random_state=42, verbose=-1))
+])
+
+# Сетка гиперпараметров
+lgb_param_grid = {
+    'classifier__n_estimators': [100, 200],
+    'classifier__learning_rate': [0.01, 0.05, 0.1],
+    'classifier__max_depth': [3, 5, 7]
+}
+
+# Поиск по сетке
+lgb_cv = GridSearchCV(lgb_pipeline, lgb_param_grid, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1)
+lgb_cv.fit(X_train, y_train)
+
+print(f"Лучшие параметры LightGBM: {lgb_cv.best_params_}")
+print(f"Лучший Train ROC-AUC: {lgb_cv.best_score_:.4f}")
+```
+
+Шаг 2.4: Сравнение моделей и финальная оценка на отложенной выборке (Test)
+Выбираем лучшую модель по результатам кросс-валидации и проводим её финальное тестирование на данных из test_df.
+```python
+# Определение лучшей модели по итогам CV (пример выбора LightGBM)
+best_model = lgb_cv.best_estimator_
+
+# Предсказание на тестовой выборке
+y_pred_proba = best_model.predict_proba(X_test)[:, 1]
+y_pred = best_model.predict(X_test)
+
+# Расчет финальной метрики
+test_roc_auc = roc_auc_score(y_test, y_pred_proba)
+
+print("=== ФИНАЛЬНЫЕ РЕЗУЛЬТАТЫ НА ТЕСТОВОЙ ВЫБОРКЕ ===")
+print(f"Финальный Test ROC-AUC: {test_roc_auc:.4f}\n")
+print("Отчет о классификации (Classification Report):")
+print(classification_report(y_test, y_pred))
+
+# Визуализация ROC-кривой
+fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+plt.figure(figsize=(7, 5))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {test_roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) на Test')
+plt.legend(loc="lower right")
+plt.show()
+```
+
 
 
 
