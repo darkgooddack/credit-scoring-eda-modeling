@@ -441,6 +441,157 @@ print(classification_report(y_test, y_test_pred_class, target_names=['Надеж
 
 - Использование class_weight='balanced_subsample'.
 - Ограничение max_depth (глубины деревьев) и min_samples_leaf для предотвращения переобучения на шумах мажоритарного класса.
+```python
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+
+# ==========================================
+# 1. Загрузка и комплексная очистка данных
+# ==========================================
+
+train_df = pd.read_excel('Training.xlsx')
+test_df = pd.read_excel('Test.xlsx')
+
+
+def clean_credit_data_for_trees(df):
+    df_clean = df.copy()
+
+    # Приведение признака "Пол" к единому регистру
+    if 'I' in df_clean.columns:
+        df_clean['I'] = df_clean['I'].astype(str).str.lower().str.strip()
+
+    # Исправление должности
+    pos_col = 'M'
+    if pos_col in df_clean.columns:
+        df_clean[pos_col] = df_clean[pos_col].astype(str).str.strip()
+        management_mask = df_clean[pos_col].isin(['Head/Deputy head (organiz.)', 'Head/Deputy head (division)'])
+        df_clean.loc[management_mask, pos_col] = 'Management'
+
+    # Коррекция признака "Занятость" (S) и "Семейное положение" (P)
+    employment_col = 'S'
+    marital_col = 'P'
+
+    if employment_col in df_clean.columns:
+        df_clean[employment_col] = df_clean[employment_col].astype(str).str.strip()
+        anomaly_mask = df_clean[employment_col] == 'No couple'
+        df_clean.loc[anomaly_mask, employment_col] = 'Unknown'
+
+        if marital_col in df_clean.columns and anomaly_mask.any():
+            df_clean.loc[anomaly_mask, marital_col] = 'Single/unmarried'
+
+    # Примечание: признаки E, F, B НЕ удаляются, так как Random Forest устойчив к мультиколлинеарности
+    return df_clean
+
+
+# Применяем очистку
+train_processed = clean_credit_data_for_trees(train_df)
+test_processed = clean_credit_data_for_trees(test_df)
+
+# Разделение на признаки и целевую переменную
+X_train_full = train_processed.drop(columns=['ID', 'MARKER'], errors='ignore')
+y_train_full = train_processed['MARKER']
+
+X_test = test_processed.drop(columns=['ID', 'MARKER'], errors='ignore')
+y_test = test_processed['MARKER']
+
+# ==========================================
+# 2. Определение пайплайна трансформации
+# ==========================================
+
+num_features = X_train_full.select_dtypes(include=[np.number]).columns.tolist()
+cat_features = X_train_full.select_dtypes(exclude=[np.number]).columns.tolist()
+
+# Для деревьев масштабирование (StandardScaler) не требуется
+num_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median'))
+])
+
+cat_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('ohe', OneHotEncoder(handle_unknown='ignore', drop='first'))
+])
+
+preprocessor = ColumnTransformer(transformers=[
+    ('num', num_transformer, num_features),
+    ('cat', cat_transformer, cat_features)
+])
+
+# Инициализация модели Случайного леса с регуляризацией против переобучения
+rf_model = RandomForestClassifier(
+    n_estimators=300,  # Оптимальное количество деревьев для стабильного ансамбля
+    max_depth=8,  # Ограничение глубины для предотвращения зазубривания шумов
+    min_samples_leaf=15,  # Минимальное количество объектов в листе для стабильности
+    class_weight='balanced_subsample',  # Динамическая балансировка классов на уровне подвыборок
+    random_state=42,
+    n_jobs=-1  # Использование всех ядер процессора для ускорения вычислений
+)
+
+pipeline_rf = Pipeline(steps=[
+    ('preprocessor', preprocessor),
+    ('classifier', rf_model)
+])
+
+# ==========================================
+# 3. Кросс-валидация (Оценка стабильности)
+# ==========================================
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+train_scores = []
+validation_scores = []
+
+print("=== ЭТАП 1: Кросс-валидация Random Forest на Training.xlsx ===")
+for fold, (train_idx, val_idx) in enumerate(cv.split(X_train_full, y_train_full), 1):
+    X_tr, X_va = X_train_full.iloc[train_idx], X_train_full.iloc[val_idx]
+    y_tr, y_va = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
+
+    pipeline_rf.fit(X_tr, y_tr)
+
+    y_tr_pred = pipeline_rf.predict_proba(X_tr)[:, 1]
+    y_va_pred = pipeline_rf.predict_proba(X_va)[:, 1]
+
+    train_auc = roc_auc_score(y_tr, y_tr_pred)
+    val_auc = roc_auc_score(y_va, y_va_pred)
+
+    train_scores.append(train_auc)
+    validation_scores.append(val_auc)
+    print(f"Фолд {fold}: Train ROC-AUC = {train_auc:.4f} | Validation ROC-AUC = {val_auc:.4f}")
+
+print(f"\n Средний Train ROC-AUC: {np.mean(train_scores):.4f}")
+print(f" Средний Validation ROC-AUC: {np.mean(validation_scores):.4f}")
+
+# ==========================================
+# 4. Финальное обучение и проверка на Test
+# ==========================================
+
+print("\n=== ЭТАП 2: Финальная проверка Random Forest на выборке Test.xlsx ===")
+
+# Обучаем модель на всех данных Training.xlsx
+pipeline_rf.fit(X_train_full, y_train_full)
+
+# Получение прогнозов
+y_test_pred_proba = pipeline_rf.predict_proba(X_test)[:, 1]
+y_test_pred_class = pipeline_rf.predict(X_test)
+
+# Расчет финальных метрик
+test_auc = roc_auc_score(y_test, y_test_pred_proba)
+gini_index = 2 * test_auc - 1
+
+print(f"Финальный TEST ROC-AUC: {test_auc:.4f}")
+print(f"Коэффициент Gini на тесте: {gini_index:.4f}")
+
+print("\nМатрица ошибок на Test:")
+print(confusion_matrix(y_test, y_test_pred_class))
+
+print("\nДетальный отчет по метрикам классификации на Test:")
+print(classification_report(y_test, y_test_pred_class, target_names=['Надежные (0)', 'Дефолтные (1)']))
+```
 
 ### Сравнительный анализ результатов Модели 1 и Модели 2
 
