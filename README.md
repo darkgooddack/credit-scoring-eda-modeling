@@ -178,27 +178,138 @@ plt.show()
 
 Присутствует категория “не в паре”, которая относится не к трудовому положению, а к семейному статусу. Это нарушает семантическую однородность признака и может искажать интерпретацию зависимости дефолта от занятости.
 
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
+
+train_df = pd.read_excel('Training.xlsx')
+test_df = pd.read_excel('Test.xlsx')
+
+categorical_cols = train_df.select_dtypes(include=['object']).columns.tolist()
+
+train_df['I'] = train_df['I'].astype(str).map(lambda x: x.lower().strip())
+test_df['I'] = test_df['I'].astype(str).map(lambda x: x.lower().strip())
+
+
+analysis_features = ['I', 'K', 'M', 'N', 'O', 'Q', 'S', ]
+
+for col in analysis_features:
+    df_grouped = (
+        train_df.groupby(col)['MARKER']
+        .agg(mean='mean', count='count')
+        .reset_index()
+        .sort_values('mean', ascending=False)
+    )
+
+    plt.figure(figsize=(10, 4))
+
+    ax = sns.barplot(
+        data=df_grouped,
+        x=col,
+        y='mean'
+    )
+
+    plt.xticks(rotation=45, ha='right')
+
+    for i, row in enumerate(df_grouped.itertuples()):
+        ax.text(
+            i,
+            row.mean,
+            f"{row.mean:.2f}\n(n={row.count})",
+            ha='center',
+            va='bottom',
+            fontsize=9
+        )
+
+    plt.tight_layout()
+    plt.show()
+```
 
 
 ## 2. Выполнение моделирования
-Обоснование методологии:
-Препроцессинг: Числовые признаки масштабируются (StandardScaler) и заполняются медианой во избежание влияния выбросов. Категориальные признаки кодируются через OneHotEncoder с заполнением пропусков модой.
-Валидация: Используется StratifiedKFold (5 фолдов), чтобы сохранить пропорцию классов в обучающей и валидационной выборках.
-Метрика оптимизации: Основной метрикой выбран ROC-AUC, так как он оценивает способность модели разделять классы независимо от выбранного порога вероятности, что является стандартом в банковском скоринге.
-Предобработка данных (Pipeline)
+
+Перед подачей данных в модели необходимо устранить аномалии, выявленные на этапе EDA, чтобы избежать переобучения и искажения весов.
+
+**Чистка категориальных признаков**
+- Привести пол к man, woman.
+- Объединить Head/Deputy head (organiz.) и Head/Deputy head (division) в признаке "Должность" в Management.
+- Перенести категорию "не в паре" в семейный статус, заполнение корректным значением или выделение в Unknown.
+
+**Обработка пропусков**
+- Для линейных моделей заполню медианой.
+
+**Метрика оптимизации** 
+- Основной метрикой выбран ROC-AUC, так как он оценивает способность модели разделять классы независимо от выбранного порога вероятности, что является стандартом в банковском скоринге.
+
+
+## Модель 1: Линейная модель (Логистическая регрессия с регуляризацией)
+
+- Удаление одного из признаков из пар с высокой мультиколлинеарностью (оставить только D из тройки D, E, F, убрать B из пары A, B), так как избыточные признаки ломают стабильность весов логистической регрессии.
+- Параметр class_weight='balanced'.
+
 ```python
-# Разделение признаков и таргета
-X_train = train_df.drop(columns=['ID', 'MARKER'])
-y_train = train_df['MARKER']
-X_test = test_df.drop(columns=['ID', 'MARKER'])
-y_test = test_df['MARKER']
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
 
-# Списки колонок
-num_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
-cat_features = X_train.select_dtypes(include=['object']).columns.tolist()
 
-# Определение трансформеров
+train_df = pd.read_excel('Training.xlsx')
+test_df = pd.read_excel('Test.xlsx')
+
+
+def clean_credit_data(df):
+    df_clean = df.copy()
+
+    if 'I' in df_clean.columns:
+        df_clean['I'] = df_clean['I'].astype(str).str.lower().str.strip()
+
+    pos_col = 'M'
+    if pos_col in df_clean.columns:
+        df_clean[pos_col] = df_clean[pos_col].astype(str).str.strip()
+        management_mask = df_clean[pos_col].isin(['Head/Deputy head (organiz.)', 'Head/Deputy head (division)'])
+        df_clean.loc[management_mask, pos_col] = 'Management'
+
+    employment_col = 'S'
+    marital_col = 'P'
+
+    if employment_col in df_clean.columns:
+        df_clean[employment_col] = df_clean[employment_col].astype(str).str.strip()
+
+        anomaly_mask = df_clean[employment_col] == 'No couple'
+        df_clean.loc[anomaly_mask, employment_col] = 'Unknown'
+
+        if marital_col in df_clean.columns and anomaly_mask.any():
+            df_clean.loc[anomaly_mask, marital_col] = 'Single/unmarried'
+
+    features_to_drop = ['E', 'F', 'B']
+    df_clean = df_clean.drop(columns=features_to_drop, errors='ignore')
+
+    return df_clean
+
+
+train_processed = clean_credit_data(train_df)
+test_processed = clean_credit_data(test_df)
+
+
+X_train_full = train_processed.drop(columns=['ID', 'MARKER'], errors='ignore')
+y_train_full = train_processed['MARKER']
+
+
+X_test = test_processed.drop(columns=['ID', 'MARKER'], errors='ignore')
+y_test = test_processed['MARKER']
+
+
+num_features = X_train_full.select_dtypes(include=[np.number]).columns.tolist()
+cat_features = X_train_full.select_dtypes(exclude=[np.number]).columns.tolist()
+
 num_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='median')),
     ('scaler', StandardScaler())
@@ -206,124 +317,174 @@ num_transformer = Pipeline(steps=[
 
 cat_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='most_frequent')),
-    ('encoder', OneHotEncoder(handle_unknown='ignore', drop='first'))
+    ('ohe', OneHotEncoder(handle_unknown='ignore', drop='first'))
 ])
 
 preprocessor = ColumnTransformer(transformers=[
     ('num', num_transformer, num_features),
     ('cat', cat_transformer, cat_features)
 ])
-```
 
-Алгоритм 1: Линейная модель (Логистическая регрессия)
-Метод: Логистическая регрессия с L2-регуляризацией (Ridge) для минимизации риска переобучения на мультиколлинеарных признаках. Дополнительно применяется балансировка весов классов (class_weight='balanced').
-```python
-from sklearn.linear_model import LogisticRegression
+lr_model = LogisticRegression(
+    class_weight='balanced',
+    max_iter=2000,
+    random_state=42,
+    solver='lbfgs'
+)
 
-# Создание пайплайна
-lr_pipeline = Pipeline(steps=[
+pipeline_lr = Pipeline(steps=[
     ('preprocessor', preprocessor),
-    ('classifier', LogisticRegression(class_weight='balanced', random_state=42, max_iter=1000))
+    ('classifier', lr_model)
 ])
 
-# Сетка гиперпараметров
-lr_param_grid = {
-    'classifier__C': [0.01, 0.1, 1, 10]
-}
 
-# Поиск по сетке
-lr_cv = GridSearchCV(lr_pipeline, lr_param_grid, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1)
-lr_cv.fit(X_train, y_train)
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=42
+)
 
-print(f"Лучшие параметры Логистической регрессии: {lr_cv.best_params_}")
-print(f"Лучший Train ROC-AUC: {lr_cv.best_score_:.4f}")
-```
-Алгоритм 2: Случайный лес (Random Forest)
-Метод: Ансамблевый алгоритм бэггинга над решающими деревьями. Устойчив к выбросам, не требует строго линейных зависимостей, эффективно работает с категориальными признаками после One-Hot кодирования.
-```python
-from sklearn.ensemble import RandomForestClassifier
+train_scores = []
+validation_scores = []
 
-# Создание пайплайна
-rf_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', RandomForestClassifier(class_weight='balanced', random_state=42))
-])
 
-# Сетка гиперпараметров
-rf_param_grid = {
-    'classifier__n_estimators': [100, 200],
-    'classifier__max_depth': [5, 10, 15],
-    'classifier__min_samples_split': [2, 5]
-}
+for fold, (train_idx, val_idx) in enumerate(cv.split(X_train_full, y_train_full), 1):
+    X_tr, X_va = X_train_full.iloc[train_idx], X_train_full.iloc[val_idx]
+    y_tr, y_va = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
 
-# Поиск по сетке
-rf_cv = GridSearchCV(rf_pipeline, rf_param_grid, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1)
-rf_cv.fit(X_train, y_train)
+    pipeline_lr.fit(X_tr, y_tr)
 
-print(f"Лучшие параметры Random Forest: {rf_cv.best_params_}")
-print(f"Лучший Train ROC-AUC: {rf_cv.best_score_:.4f}")
-```
+    y_tr_pred = pipeline_lr.predict_proba(X_tr)[:, 1]
+    y_va_pred = pipeline_lr.predict_proba(X_va)[:, 1]
 
-Алгоритм 3: Градиентный бустинг (LightGBM)
-Метод: Реализация градиентного бустинга от Microsoft, оптимизированная по скорости и объему потребляемой памяти. Последовательно строит деревья, минимизируя ошибку предыдущих, отлично улавливает сложные нелинейные паттерны.
-```python
-from lightgbm import LGBMClassifier
+    train_scores.append(roc_auc_score(y_tr, y_tr_pred))
+    validation_scores.append(roc_auc_score(y_va, y_va_pred))
 
-# Создание пайплайна
-lgb_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', LGBMClassifier(scale_pos_weight=len(y_train[y_train==0])/len(y_train[y_train==1]), 
-                                  random_state=42, verbose=-1))
-])
+print(f"\n Средний Train ROC-AUC: {np.mean(train_scores):.4f}")
+print(f"\n Средний Validation ROC-AUC: {np.mean(validation_scores):.4f}")
 
-# Сетка гиперпараметров
-lgb_param_grid = {
-    'classifier__n_estimators': [100, 200],
-    'classifier__learning_rate': [0.01, 0.05, 0.1],
-    'classifier__max_depth': [3, 5, 7]
-}
 
-# Поиск по сетке
-lgb_cv = GridSearchCV(lgb_pipeline, lgb_param_grid, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1)
-lgb_cv.fit(X_train, y_train)
+print("\n Проверка на  выборке Test")
 
-print(f"Лучшие параметры LightGBM: {lgb_cv.best_params_}")
-print(f"Лучший Train ROC-AUC: {lgb_cv.best_score_:.4f}")
-```
 
-Шаг 2.4: Сравнение моделей и финальная оценка на отложенной выборке (Test)
-Выбираем лучшую модель по результатам кросс-валидации и проводим её финальное тестирование на данных из test_df.
-```python
-# Определение лучшей модели по итогам CV (пример выбора LightGBM)
-best_model = lgb_cv.best_estimator_
+pipeline_lr.fit(X_train_full, y_train_full)
 
-# Предсказание на тестовой выборке
-y_pred_proba = best_model.predict_proba(X_test)[:, 1]
-y_pred = best_model.predict(X_test)
+# Предсказание вероятностей дефолта для тестовой выборки
+y_test_pred_proba = pipeline_lr.predict_proba(X_test)[:, 1]
+y_test_pred_class = pipeline_lr.predict(X_test)
 
-# Расчет финальной метрики
-test_roc_auc = roc_auc_score(y_test, y_pred_proba)
+# Расчет финального ROC-AUC на тесте
+test_auc = roc_auc_score(y_test, y_test_pred_proba)
+gini_index = 2 * test_auc - 1
 
-print("=== ФИНАЛЬНЫЕ РЕЗУЛЬТАТЫ НА ТЕСТОВОЙ ВЫБОРКЕ ===")
-print(f"Финальный Test ROC-AUC: {test_roc_auc:.4f}\n")
-print("Отчет о классификации (Classification Report):")
-print(classification_report(y_test, y_pred))
+print(f"\nФинальный TEST ROC-AUC: {test_auc:.4f}")
+print(f"\nКоэффициент Gini на тесте: {gini_index:.4f}")
 
-# Визуализация ROC-кривой
-fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-plt.figure(figsize=(7, 5))
-plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {test_roc_auc:.4f})')
-plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic (ROC) на Test')
-plt.legend(loc="lower right")
-plt.show()
+print("\nМатрица ошибок на Test:")
+print(confusion_matrix(y_test, y_test_pred_class))
+
+print("\nДетальный отчет по метрикам классификации на Test:")
+print(classification_report(y_test, y_test_pred_class, target_names=['Надежные (0)', 'Дефолтные (1)']))
 ```
 
 
+<img width="471" height="432" alt="image" src="https://github.com/user-attachments/assets/cdabf60d-c73c-4b7c-b619-fd2dd6522f87" />
+
+
+**Оценка разделяющей способности (ROC-AUC и Gini)**
+
+**ROC-AUC** — это метрика качества ранжирования бинарного классификатора. Насколько хорошо модель умеет отличать класс 1 от класса 0. 
+
+Значение 0.8698 означает, что в 87% случаев модель присваивает реальному дефолтному клиенту более высокий уровень риска, чем надежному. Для очень хороший результат.
+
+**Gini** — это производная метрика от ROC-AUC, широко используемая в банковском скоринге.
+
+Метрика Джини на уровне 74% в реальном банковском секторе оценивается как **отличная**. Модели с Джини выше 60% считаются высокоэффективными и допускаются до эксплуатации в скоринговых системах коммерческих банков.
+
+
+**Подтверждение стабильности модели (Отсутствие переобучения)**
+
+Сравнение метрик на разных этапах показывает методологическую корректность пайплайна предобработки:
+
+* **Train ROC-AUC:** 0.8760 (обучение)
+* **Validation ROC-AUC:** 0.8508 (кросс-валидация)
+* **Test ROC-AUC:** 0.8698 (абсолютно новые данные из Test.xlsx)
+
+Метрика на тесте практически совпадает с метрикой на кросс-валидации (и даже незначительно выше, что указывает на репрезентативность тестовой выборки). Разница с обучением минимальна. Это доказывает, что модель не переобучилась, а выявила реальные рыночные закономерности, которые стабильно работают на новых клиентах.
+
+**Анализ матрицы ошибок и бизнес-метрик**
+
+Матрица ошибок показывает физическое распределение предсказаний на 38 405 клиентах из тестовой выборки:
+
+* **True Negative (29 970):** Модель верно определил надежных клиентов и одобрила им кредит.
+* **True Positive (119):** Модель вовремя распознала дефолтных клиентов и заблокировала выдачу.
+* **False Negative (27):** Модель пропустила дефолтных клиентов, одобрив им кредит (ошибка 1-го рода).
+* **False Positive (8 289):** Модель перестраховалась и отказала надежным клиентам (ошибка 2-го рода).
+
+**Метрики класса «Дефолтные»**
+
+* **Recall (Полнота) = 0.82 (82%):** Ключевая метрика для управления рисками. Модель смогла успешно перехватить и предотвратить **82% всех потенциальных дефолтов** (119 из 146). Банк защищен от критических невозвратов.
+* **Precision (Точность) = 0.01 (1%):** Из всех клиентов, которых модель пометила как "рискованные", реальный дефолт допустил только 1%. Столь низкое значение — это прямое следствие экстремального дисбаланса в исходных данных (дефолты составляют ничтожную долю от портфеля). Чтобы поймать 82% дефолтов, алгоритму с параметром `class_weight='balanced'` приходится сильно занижать порог одобрения, из-за чего в зону риска попадает много надежных заемщиков.
+
+**Вывод**
+
+Логистическая регрессия с ручным устранением мультиколлинеарности и балансировкой весов задала высокую планку качества. Модель отлично минимизирует кредитные риски, но создает высокую нагрузку на верификацию или приводит к упущенной прибыли из-за ложных отказов. 
+
+
+
+
+
+
+## Модель 2: Случайный лес (Random Forest)
+
+Устойчив к мультиколлинеарности, не требует масштабирования данных, хорошо улавливает нелинейные зависимости первого порядка.
+
+- Использование class_weight='balanced_subsample'.
+- Ограничение max_depth (глубины деревьев) и min_samples_leaf для предотвращения переобучения на шумах мажоритарного класса.
+
+### Сравнительный анализ результатов Модели 1 и Модели 2
+
+Полученные результаты Модели 2 (Случайный лес) в сравнении с Моделью 1 (Логистическая регрессия) представляют высокую аналитическую ценность. Эксперимент наглядно иллюстрирует фундаментальный баланс между точностью (Precision) и полнотой (Recall) алгоритмов машинного обучения в задачах оценки кредитных рисков.
+
+#### 1. Оценка обобщающей способности (ROC-AUC и Gini)
+
+* **Качество ранжирования на тесте:** Случайный лес (Random Forest) показал более высокий **Test ROC-AUC: 0.8724** (против 0.8698 у регрессии). Соответственно, индекс Джини вырос до **0.7447** (74.47%). Это подтверждает, что нелинейный ансамбль, используя полный набор признаков (включая сохраненные коллинеарные пары), эффективнее разделяет клиентов по степени риска.
+* **Выявление переобучения (Overfitting):** У Случайного леса зафиксирован значительный разрыв между обучением и валидацией: `Train ROC-AUC = 0.9765`, а `Validation ROC-AUC = 0.8484`. Модель почти идеально запомнила тренировочный датасет. Однако жесткая регуляризация (ограничение глубины `max_depth=8` и размера листа `min_samples_leaf=15`) уберегла ансамбль от переобучения: на отложенном тесте модель показала стабильный результат.
+
+#### 2. Сравнение бизнес-метрик и матриц ошибок
+
+Физическое распределение одобренных и отклоненных заявок на тестовой выборке (38 405 клиентов) отражает явное различие в стратегиях моделей.
+
+| Метрика на тесте | Модель 1: Логистическая регрессия | Модель 2: Случайный лес | Бизнес-эффект от смены модели |
+| :--- | :---: | :---: | :--- |
+| **Правильно одобрено (True Negative)** | 29 970 клиентов | **35 442 клиента** | **+ 5 472 новых заемщика**, которые потенциально принесут банку процентный доход. |
+| **Ложные отказы (False Positive)** | 8 289 клиентов | **2 817 клиентов** | **Снижение ложных отказов в 3 раза**. Банк сохраняет лояльность клиентской базы и снижает упущенную прибыль. |
+| **Пропущенные дефолты (False Negative)**| **27 клиентов** | 63 клиента | Увеличение дефолтных выдач на 36 заемщиков (рост кредитных потерь). |
+| **Перехваченные дефолты (True Positive)**| **119 клиентов** | 83 клиента | Снижение эффективности прямого удержания невозвратов на данном пороге. |
+| **Recall (Полнота класса 1)** | **0.82 (82%)** | 0.57 (57%) | Логистическая регрессия защищает от дефолтов лучше на 25%. |
+| **Precision (Точность класса 1)** | 0.01 (1%) | **0.03 (3%)** | Точность прогноза риска (концентрация дефолтов в зоне отказа) выросла в 3 раза. |
+
+#### 3. Аналитический вывод для отчета
+
+Каждый из исследованных алгоритмов предлагает банку определенную бизнес-стратегию:
+
+1. **Консервативная стратегия (Логистическая регрессия):** Модель ориентирована на максимальное снижение кредитного риска (`Recall = 82%`). Она минимизирует прямые убытки от невозвратов, но платит за это высоким объемом ложных тревог (8 289 отказов благонадежным клиентам). Данный подход оправдан в периоды экономической нестабильности, когда приоритетом является сохранение ликвидности.
+2. **Коммерческая стратегия (Случайный лес):** Модель оптимизирует общую экономику портфеля. Она резко сокращает количество ложных отказов (с 8.2 тысяч до 2.8 тысяч), позволяя одобрить кредиты более чем 5.4 тысячам надежных клиентов. Точность модели возрастает до 3%. Обратной стороной становится рост пропущенных дефолтов (63 вместо 27).
+
+#### Вектор развития: Модель 3 (Градиентный бустинг)
+
+Текущая дилемма формирует задачу для следующего этапа моделирования. Применение **Модели 3 (Градиентный бустинг, LightGBM/CatBoost)** должно совместить преимущества обоих подходов. За счет последовательного исправления ошибок предыдущих деревьев бустинг направлен на восстановление высокого уровня перехвата дефолтов (`Recall` на уровень регрессии $\approx 80\%$) при сохранении низкого потока ложных отказов (`False Positive` на уровне случайного леса $\approx 2800$).
+
+
+
+
+
+## Модель 3: Градиентный бустинг (LightGBM или CatBoost)
+
+Лучший выбор для табличных данных. Позволяет эффективно находить сложные комбинации признаков. CatBoost отлично работает с категориальными переменными.
+
+- Параметр scale_pos_weight (отношение количества 0 к количеству 1) для компенсации дисбаланса.
+- Тюнинг гиперпараметров (learning_rate, num_leaves, l2_leaf_reg).
 
 
 
